@@ -1,0 +1,24 @@
+{
+  "planned_move_created": {
+    "category": "player",
+    "sounds": [ "projectionsorcery:naoya_planned_move_success" ]
+  },
+  "freeze": {
+    "category": "player",
+    "sounds": [
+      {
+        "name": "projectionsorcery:naoya_freeze_sfx",
+        "attenuation_distance": 20
+      }
+    ]
+  },
+  "unfreeze": {
+    "category": "block",
+    "sounds": [
+      {
+        "name": "projectionsorcery:naoya_glass_break_sfx",
+        "attenuation_distance": 20
+      }
+    ]
+  }
+}

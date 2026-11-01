@@ -1,0 +1,353 @@
+==============================================================================
+HANDOFF: "Projection Sorcery Unlimited" - NeoForge 1.21.1 mod (current: 1.0.2-BETA)
+==============================================================================
+Written for another AI/dev that continues this project. Read all of it first.
+
+------------------------------------------------------------------------------
+1. WHAT THIS IS
+------------------------------------------------------------------------------
+A Minecraft mod (NeoForge 1.21.1, Java 21) that recreates Naoya/Naobito Zenin's
+"Projection Sorcery" from Jujutsu Kaisen, modeled on the Fabric mod "Arlo's /
+Orlan's Projection Sorcery" (1.21.1, All Rights Reserved -> NEVER copy its code;
+only the general idea was used: phases IDLE/PLANNING/REPLAY, recorded frames,
+attack frames).
+
+Core idea: the player plans a path in "frozen time" (client-side simulated body),
+then the server replays it frame by frame with teleports, attacks and insta-mined
+blocks. Extras: cursed energy (CE), freeze-in-glass penalty, targets, "touch"
+(impose the 24-frame rule on a victim), afterimages, themes.
+
+Mod id: projectionsorcery      Package: com.projectionsorcery
+Version history:
+  1.0.0 RELEASE  first version (free camera, server blink, no CE system)
+  1.0.1 BETA     physics body, CE, freeze, multiplayer limits, targets, touch,
+                 afterimages, settings GUI
+  1.0.2 BETA     server path validation, tick-rate-1 instead of /tick freeze,
+                 opOnly removed, red victim blocks, Naoya/Naobito visuals
+Keep CHANGELOG_AND_GUIDE.md updated for every new version (user asked for it;
+label versions like "1.0.3 / BETA").
+
+------------------------------------------------------------------------------
+2. CURRENT STATE - READ THIS
+------------------------------------------------------------------------------
+* NOTHING HAS EVER BEEN COMPILED OR RUN. The authoring sandbox could not reach
+  maven.neoforged.net. All code was written from memory of the 1.21.1 /
+  NeoForge 21.1 APIs. Expect compile errors (see section 8 for the likeliest).
+* FIRST TASK for you: build it (./gradlew build), fix compile errors, then
+  ./gradlew runClient and test every feature (checklist in section 10).
+* Project is based on the official MDK:
+  https://github.com/NeoForgeMDKs/MDK-1.21.1-ModDevGradle  (neo_version=21.1.265,
+  ModDevGradle, Parchment 2024.11.17 mappings). gradle.properties: mod_id,
+  mod_name, mod_group_id=com.projectionsorcery, mod_version=1.0.2-beta.
+  The MDK template src/main/templates/META-INF/neoforge.mods.toml is used as-is
+  (values come from gradle.properties).
+* Deliverables convention: zip of the project + CHANGELOG_AND_GUIDE.md.
+
+------------------------------------------------------------------------------
+3. FILE MAP (src/main/java/com/projectionsorcery/)
+------------------------------------------------------------------------------
+ProjectionSorcery.java     @Mod entry. Registers COMMON + CLIENT configs, payloads
+                           (network version "2"), and NeoForge.EVENT_BUS.register(
+                           ServerLogic.class).
+ClientPayloadHandler.java  server->client payload handlers; only forwards to
+                           client.ClientEvents (so dedicated servers never load
+                           client classes).
+Config.java                COMMON config (gameplay). Sections: replay, planning,
+                           cursedEnergy, multiplayerLimits, touch, pathValidation,
+                           freeze. (No opOnly any more - removed on request.)
+ClientConfig.java          CLIENT config: theme (Theme enum).
+Theme.java                 NAOYA / NAOBITO: hud color, highlight, ghostRgb,
+                           ghostAlpha, wireframe flag, overlayRgb, overlayAlpha.
+                           Add new themes here; settings GUI cycles all entries.
+
+net/Frame.java             record(x,y,z = EYE position, yaw, pitch, action byte,
+                           blockPos long). action: NONE=0, STRIKE=1, BREAK=2.
+net/Payloads.java          all payload records + codec helper:
+  C->S: PlanChunk(first,execute,frames[<=600]), TouchPlan(victimId,waypoints),
+        StartRequest, EndSession, Jump
+  S->C: Session(kind 0 deny/1 grant/2 time up, maxTicks, msg), Ce(ce,max,inf),
+        FreezeFx(ticks), TouchFx(index,waypoints; empty = effect over)
+  (Plans are streamed in 600-frame chunks because custom payloads are limited to
+  ~32 KB. Frame = 41 bytes.)
+
+server/ServerLogic.java    ALL server behaviour (static, registered on game bus):
+                           session management, replay, CE, freeze (glass), touch,
+                           damage immunity, logout cleanup. See section 4.
+server/PathValidator.java  Server-side reference simulation used to validate
+                           replayed frames (section 5).
+
+client/ClientEvents.java   Client state machine (Mode IDLE/REQUESTING/PLANNING/
+                           TOUCH), key handling, planning tick, recording, touch
+                           planning, targets, quick move, HUD, input cancelling,
+                           camera lock while frozen, tick-rate override.
+client/ClientModEvents.java key mappings (MOD bus) + HUD layer registration.
+client/Sim.java            Client physics for a detached body (Entity#move with
+                           own gravity/jump/step logic). hero=true -> infinite air
+                           jumps, step height 3, walks on water.
+client/PlanBody.java       RemotePlayer subclass: ignores powder snow & block speed
+                           factor. Used as the planner's body/camera.
+client/GhostPlayer.java    RemotePlayer subclass without name tag (afterimages).
+client/PathPlanner.java    Voxel A* + "points -> frames" conversion
+                           (fromPoints()). ALL predetermined paths (target routes,
+                           quick move to target, quick move) go through
+                           fromPoints() and ClientEvents.sendPlan().
+client/Render.java         RenderLevelStageEvent (AFTER_ENTITIES): afterimages,
+                           path previews, red target box, red victim blocks.
+client/TintConsumer.java   VertexConsumer wrapper forcing flat color + alpha
+                           (Naoya afterimages).
+client/OutlineConsumer.java VertexConsumer that turns model quads into 4 white
+                           line segments each (Naobito wireframe afterimages).
+client/SettingsScreen.java Settings GUI (theme button; more settings to be added).
+
+Resources: assets/projectionsorcery/lang/en_us.json (key names).
+Docs: CHANGELOG_AND_GUIDE.md, README.md.
+
+------------------------------------------------------------------------------
+4. RUNTIME FLOW
+------------------------------------------------------------------------------
+PLANNING SESSION
+ 1. Client R (IDLE) -> StartRequest. Mode REQUESTING (60 tick timeout).
+ 2. Server (ServerTickEvent.Post): requests collected per tick.
+      >1 request in the same tick -> ALL denied ("Simultaneous use").
+      otherwise first come first served; denied if someone else has a session,
+      player is replaying/frozen, or on cooldown.
+    Grant: sessionOwner set; server tick rate lowered to 1 via
+    server.tickRateManager().setTickRate(1.0F) (remembers previous rate; NO
+    command is used, so no chat feedback); Session(1,maxTicks) sent.
+    maxTicks = 0 (unlimited) unless players online > playerThreshold(2): then
+    maxPlanSeconds*20 (3 s) and after the session a 5 s cooldown (wall clock).
+ 3. Client PLANNING: creates PlanBody (Sim.hero) as camera entity
+    (mc.setCameraEntity). Real LocalPlayer input is zeroed via
+    MovementInputUpdateEvent. Every client tick: Sim.tick(), record Frame if the
+    body moved / rotated / action pending. Client resets its own tick rate to 20
+    every frame (RenderFrameEvent.Pre) because the server tick-rate packet would
+    otherwise slow the planner's client too.
+    Air jump -> Jump payload -> server adds exhaustion (jumpHungerCost*4).
+    LMB: entity in reach 3 -> STRIKE frame; block in reach 4.5 -> BREAK frame
+    (block removed LOCALLY only so you can plan through it; restored before
+    sending); nothing -> STRIKE. Blocks with hardness<0 or blast resistance >
+    maxBlastResistance(32) are refused.
+    RMB on a highlighted target route -> executes that route.
+ 4. Execute (R / route / time limit): client restores local blocks, sends
+    TouchPlan (optional) then PlanChunk(s). Server onPlan(execute=true): creates
+    Replay (with a PathValidator) and IMMEDIATELY ends the session -> tick rate
+    restored (requirement: restore on execute, not when the replay finishes).
+ 5. Replay (ServerTickEvent.Post, replayFramesPerTick frames per tick, default 4):
+    per frame: validate path -> spend CE (frame cost) -> sp.connection.teleport
+    -> STRIKE: spend attackCost + damage entities on a ray (config reach 3.5) ->
+    BREAK: validate block, spend blockCost, drop loot with the held tool
+    (Block.dropResources) but NO durability damage, destroyBlock(drop=false).
+    -> touch arming when the victim is within touch range.
+    Result codes: 0 ok, 1 out of CE (-> finish + FREEZE), 2 invalid path (-> stop).
+    finish(): zero velocity, lift the player upward if inside blocks.
+ 6. Player is invulnerable (LivingIncomingDamageEvent) while owning a session or
+    replaying (except damage that bypasses invulnerability).
+
+QUICK MOVE (V): client raycasts, finds a collision-free spot, builds a straight
+path via PathPlanner.fromPoints(step 0.28) and sends it with sendPlan() - same
+pipeline as every other path (user requirement). No session / no tick rate change.
+QUICK MOVE TO TARGET (B): computeCandidates() -> shortest -> sendPlan().
+
+TARGET (Z): CLIENT ONLY (nobody else is told). Entity id or BlockPos stored in
+ClientEvents; red box rendered. In planning, up to 4 routes (direct + 4 detours,
+deduplicated) to the target's BACK (PathPlanner.goalBehind) or to the block
+(goalForBlock) are drawn; the one under the crosshair is highlighted.
+
+TOUCH (C) - planning only: nearest Player/Mob within touch range of the planning
+body. Mode TOUCH: camera moves to a victim body (Sim.victim, vanilla-like physics,
+no air jumps), max 10 blocks traveled. Waypoints = grounded block positions.
+Press C again -> back to own plan. On execute the TouchPlan is sent; server arms
+the touch when the player comes within 3 blocks of the victim during the replay:
+  player victim: gets TouchFx (red markers), 2 s aware time, then 1 s per block,
+  timer resets each block, timer 0 -> FREEZE. Mobs are teleported along the path.
+
+FREEZE (glass): player cannot move/turn for 1 s, glass placed in feet+head blocks
+(only replaces air/replaceable), glass-break sound on place and on removal.
+Server pulls the player back if they move; client zeroes input and locks the
+camera angles (ViewportEvent.ComputeCameraAngles).
+
+CE: Config cursedEnergy.infinite (default true). If false: max, regenPerTick,
+frameCost 15, attackCost 45, blockCost 150. Stored in player persistent data
+(key "projectionsorcery_ce"), synced to client every 10 ticks if changed.
+
+------------------------------------------------------------------------------
+5. PATH VALIDATION (PathValidator) - requirement text
+------------------------------------------------------------------------------
+"The path can go max 3 blocks off the physically possible course, or 5 if the
+player was jumping."
+Implementation: for each frame, a sim body (0.6x1.8 AABB, starts at the player's
+real position) moves toward the claimed FEET position (frame y - 1.62), limited
+to sprint speed*1.15 per frame, with gravity, jumps (infinite air jumps), step
+height 3, water walking, collision from the LIVE world (so blocks broken earlier
+in the replay are gone). Accepted if |claimed - sim| <= 3 (<= 5 if sim airborne or
+claimed above sim by >0.05). The sim does NOT resync to the claimed position.
+Caveats: no ladders/vines/scaffolding/bubble columns/honey etc.; frames are
+assumed 1 per client tick; tolerances are config values.
+
+------------------------------------------------------------------------------
+6. USER REQUIREMENTS (full list, for reference; all implemented unless noted)
+------------------------------------------------------------------------------
+- NeoForge 1.21.1, like Arlo's mod; unlimited frames and CE (CE configurable).
+- Planning: temp body with the player's stats, obeys Minecraft physics; infinite
+  air jumps costing 0.5 hunger each (configurable); step up to 3 blocks (slabs,
+  stairs, full blocks); walks on water; not slowed by powder snow/water; rest of
+  the world slowed (now: server tick rate 1); insta-mine marking without tool
+  durability use.
+- Anime accuracy: cannot break unbreakable blocks or blast resistance > 32.
+- CE: configurable; if finite: 15/frame, 45/attack frame, 150/broken block; out
+  of CE while replaying -> freeze.
+- "Freeze them" = stop camera+body 1 s, 2 glass blocks, glass-break sound on
+  place and on removal.
+- Two players starting in the same tick: both cancelled; otherwise the first wins.
+- >2 players online: 5 s cooldown, planning max 3 s.
+- Target keybind (client only, red indicator); target routes to the target's back;
+  aim + right click executes; Quick move to target = same routes, shortest one,
+  instantly. Block targets: same with a path to the block.
+- Touch keybind (see section 4).
+- Afterimages of own planned moves and the victim's planned moves, translucent,
+  colored by theme, with a highlight.
+- Settings GUI: theme Naoya/Naobito (user plans to add more later).
+- Quick move (V): same function as executing a predetermined path, skipping
+  planning.
+- Server-side path validation (3 / 5 blocks).
+- Tick rate 1 for everyone except the planner (not freeze); NOT opOnly; no one but
+  the planner should see changes before execution; tick rate back to 20 when
+  EXECUTED (not when the replay ends).
+- Victim blocks highlighted RED regardless of theme.
+- Naoya theme: in-world projection translucent blue/cyan (transparency 0.3-0.4);
+  planner's whole screen overlaid with slightly transparent blue (0.5-0.6).
+- Naobito theme: in-world projection fully transparent with solid white outlines;
+  planner's screen gets a small black tint (0.8-0.9).
+  >>> I interpreted "transparency" as the fraction that is transparent (so
+  >>> ghost alpha ~0.65, Naoya overlay alpha ~0.45, Naobito tint alpha ~0.15).
+  >>> The user has not confirmed this. Easy to flip in Theme.java.
+  >>> Colors were NOT verified against reference images (image search is not
+  >>> allowed for anime content; text search gave nothing).
+
+------------------------------------------------------------------------------
+7. KNOWN INTERPRETATIONS / OPEN QUESTIONS (ask the user if unsure)
+------------------------------------------------------------------------------
+- "no one except the user should see anything changing before the plan gets
+  executed": implemented as: nothing is broadcast (no command feedback), blocks
+  are only changed locally, afterimages/overlay/targets are client-only. BUT the
+  tick rate is server-global and vanilla sends a ClientboundTickingStatePacket
+  to every client, so OTHER players' worlds visibly slow to 1 tick/s while
+  someone plans. This is an unresolved conflict with the user's wording. Options:
+  (a) accept; (b) a mixin to suppress the packet for non-planners (mod currently
+  uses no mixins) - still leaves server-driven entity updates at 1/s for them;
+  (c) per-player slow motion done purely client-side while the server stays at
+  20 TPS (breaks "world is really frozen while planning"). Ask the user.
+- 0.5 hunger per air jump = 2.0 exhaustion (4 exhaustion = 1 hunger point).
+  Not refunded on cancel.
+- Touch triggers the first time the player is within range of the victim during
+  the replay; victim waypoints = blocks the victim sim stood on.
+- Cooldown starts when ANY session ends (execute/cancel/timeout).
+- Quick move is validated and therefore walking pace (0.28/frame); the user has
+  not commented on the lost "insta" feel. Replay speed is the lever
+  (replayFramesPerTick).
+
+------------------------------------------------------------------------------
+8. UNVERIFIED API ASSUMPTIONS (likely compile/runtime trouble spots)
+------------------------------------------------------------------------------
+Check each against the real 1.21.1 / NeoForge 21.1.265 sources:
+ - Payload registration: PayloadRegistrar playToServer/playToClient signatures,
+   IPayloadContext.enqueueWork / player(); StreamCodec anonymous implementation
+   (decode(B) / encode(B,V)) in Payloads.codec().
+ - PacketDistributor.sendToServer / sendToPlayer signatures.
+ - ModConfigSpec: defineEnum, EnumValue.set/save, push/pop in static blocks.
+ - @EventBusSubscriber(bus = EventBusSubscriber.Bus.MOD, value = Dist.CLIENT).
+ - Events: ClientTickEvent.Pre/Post, RenderFrameEvent.Pre, RenderLevelStageEvent
+   .Stage.AFTER_ENTITIES (+ whether getPoseStack() already contains the camera
+   rotation), InputEvent.InteractionKeyMappingTriggered (isAttack/isUseItem),
+   MovementInputUpdateEvent (Input fields up/down/left/right/jumping/
+   shiftKeyDown/leftImpulse/forwardImpulse), ViewportEvent.ComputeCameraAngles,
+   ServerTickEvent.Post, LivingIncomingDamageEvent, PlayerEvent.PlayerLoggedOutEvent,
+   RegisterGuiLayersEvent.registerAboveAll(ResourceLocation, LayeredDraw.Layer).
+ - server.tickRateManager().setTickRate(float) / tickrate() / isFrozen().
+   Also: does the server loop really apply a new tick rate immediately when it
+   is set back to 20 (first tick may be up to 1 s late - documented).
+ - Entity API: Entity#moveTo/setPos/xOld/yOld/zOld fields, LivingEntity
+   yBodyRot/yHeadRot(+O) fields, Entity.verticalCollision, onGround(),
+   Entity#maxUpStep reading Attributes.STEP_HEIGHT for LivingEntity (the 3-block
+   step height relies on this), RemotePlayer(ClientLevel, GameProfile),
+   getBlockSpeedFactor() overridable, makeStuckInBlock public,
+   EntityType#create(Level) nullable, Entity#shouldShowName public.
+ - MobEffects.JUMP (name in 1.21.1), Attributes.JUMP_STRENGTH / GRAVITY /
+   STEP_HEIGHT.
+ - ServerPlayer: connection.teleport(x,y,z,yaw,pitch), serverLevel(), server field,
+   gameMode.getGameModeForPlayer(), blockActionRestricted(level,pos,gameType).
+ - Shapes.collide(Direction.Axis, AABB, Iterable<VoxelShape>, double) (PathValidator).
+ - Block#getExplosionResistance() public no-arg; BlockState#getDestroySpeed.
+ - Rendering: VertexConsumer abstract method set (addVertex(x,y,z), setColor
+   (r,g,b,a), setUv, setUv1, setUv2, setNormal) used by TintConsumer and
+   OutlineConsumer; LevelRenderer.renderLineBox(PoseStack, VertexConsumer, AABB,
+   r,g,b,a); EntityRenderDispatcher.render(...) signature and setRenderShadow;
+   texture "textures/block/white_concrete.png"; BufferSource behaviour when two
+   non-fixed render types are used (Render.java deliberately never has the
+   translucent and lines builders open at the same time - keep it that way).
+ - GuiGraphics.fill / drawString / drawCenteredString; Screen.render (assumed
+   to draw the background itself in 1.21.1 - if the blur is drawn twice the game
+   throws "Can only blur once per frame": then drop the explicit call / adjust).
+ - ClientLevel tickRateManager().setTickRate(float) reachable on the client.
+
+------------------------------------------------------------------------------
+9. KNOWN BUGS / LIMITATIONS / IDEAS
+------------------------------------------------------------------------------
+- PathPlanner: slabs/stairs count as non-standable ground; 6000 node cap; may
+  find no route in complex terrain; linear height interpolation for steps.
+- Step height 3 may look odd under ceilings (vanilla step algorithm).
+- Water walking can jitter on flowing water; no lava/damage-block avoidance in sim.
+- Replay that ends inside blocks lifts the player to the first free spot upward
+  (can be far in caves).
+- Insta-mine ignores claim/protection mods (only vanilla restrictions checked).
+- Afterimages: flat-color silhouettes for every entity (no skin/armor).
+  Naobito outline shows every quad edge (also hidden faces).
+- Camera lock during freeze is client-side + server pull-back; a modified client
+  can ignore the lock (server still pulls position back).
+- Only one touch target per plan. Touch victim that is the planner's own
+  target is not specially handled.
+- No sounds/particles for planning start/end (could add, but "nobody else should
+  notice" - keep client-only).
+- Ideas the user mentioned wanting later: more themes (add to Theme enum), more
+  GUI settings.
+- Possible cleanups: unit-testable PathValidator, config for ghost count/distance,
+  localisation of HUD strings (currently hard-coded English), server messages.
+
+------------------------------------------------------------------------------
+10. TEST CHECKLIST (do this after it compiles)
+------------------------------------------------------------------------------
+ 1. Dedicated server starts (no client classes loaded; ClientPayloadHandler path).
+ 2. Singleplayer: R -> planning: WASD/jump/air jump, hunger drain, step up 3,
+    walk on water, powder snow not slowing, 24-frame HUD counter, overlay.
+ 3. LMB block: disappears locally; execute -> really broken, no tool damage, loot
+    drops; bedrock/obsidian refused.
+ 4. LMB mob: attack frame damages on replay.
+ 5. Tick rate: other mobs ~frozen while planning; back to 20 immediately on
+    execute/cancel; planner client still 20 TPS; no chat spam.
+ 6. Path validation: normal paths pass; edit a client to send a teleport path ->
+    rejected; paths with mined walls pass.
+ 7. CE finite mode: costs, regen, freeze (glass + sounds + lock) when empty.
+ 8. Multiplayer (3+ players): 3 s limit auto-executes, 5 s cooldown, same-tick
+    start cancels both, second requester denied while a session is active.
+ 9. Z target on mob/player/block; routes drawn; hover highlight; RMB executes; B
+    quick-to-target.
+10. C touch on player and mob; victim sees red blocks, 2 s grace, 1 s/block timer,
+    freeze on fail.
+11. V quick move (walking-pace path, costs CE per frame).
+12. K settings GUI; both themes look right (afterimages, overlay, red victim
+    blocks); config files written (projectionsorcery-common.toml / -client.toml).
+
+------------------------------------------------------------------------------
+11. HOW TO WORK WITH THIS USER
+------------------------------------------------------------------------------
+- Their stated preference: keep everything to the point, no useless info, only
+  trustworthy sources when researching.
+- They give feature lists in bullet points and refine over several messages.
+  Implement what is asked, state interpretations briefly, flag anything
+  unverified honestly (especially "not compiled").
+- Always ship: project zip + updated CHANGELOG_AND_GUIDE.md; label the version
+  (e.g. 1.0.3 / BETA) and keep the conversation summary in the changelog.
+- Do not copy code from Arlo's/Orlan's mod (All Rights Reserved).
+- Do not add opOnly back (user explicitly removed it).
+- Tick rate must be restored when the plan is EXECUTED, not when it finishes.
+- Victim blocks are always red.

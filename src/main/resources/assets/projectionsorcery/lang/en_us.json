@@ -1,0 +1,10 @@
+{
+  "key.categories.projectionsorcery": "Projection Sorcery",
+  "key.projectionsorcery.toggle": "Start planning / Execute",
+  "key.projectionsorcery.cancel": "Cancel planning",
+  "key.projectionsorcery.quick": "Quick move",
+  "key.projectionsorcery.touch": "Touch (victim plan)",
+  "key.projectionsorcery.target": "Target (client only)",
+  "key.projectionsorcery.quick_target": "Quick move to target",
+  "key.projectionsorcery.settings": "Open settings"
+}
